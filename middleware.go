@@ -2,7 +2,6 @@ package jwtauth
 
 import (
 	"context"
-	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -28,19 +27,32 @@ func UserIDFromGinContext(c *gin.Context) (int64, bool) {
 	return id, ok
 }
 
-func GinMiddleware(mgr *Manager) gin.HandlerFunc {
+func GinMiddleware(mgr *Manager, bl *Blacklist) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		hdr := c.GetHeader("Authorization")
 		if hdr == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+			c.AbortWithStatusJSON(401, gin.H{"error": "missing token"})
 			return
 		}
-		tok := strings.TrimPrefix(hdr, "Bearer ")
-		userID, _, err := mgr.ValidateAccessToken(tok)
+
+		token := strings.TrimPrefix(hdr, "Bearer ")
+
+		exists, err := bl.Exists(token)
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+			c.AbortWithStatusJSON(500, gin.H{"error": "internal error"})
 			return
 		}
+		if exists {
+			c.AbortWithStatusJSON(401, gin.H{"error": "token revoked"})
+			return
+		}
+
+		userID, _, err := mgr.ValidateAccessToken(token)
+		if err != nil {
+			c.AbortWithStatusJSON(401, gin.H{"error": "invalid token"})
+			return
+		}
+
 		c.Set("user_id", userID)
 		c.Next()
 	}

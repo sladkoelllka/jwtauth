@@ -40,8 +40,8 @@ func (m *Manager) WithDurations(access, refresh time.Duration) *Manager {
 // Генерация токенов
 // --------------------
 
-func (m *Manager) GenerateTokenPair(userID int64, extraClaims map[string]interface{}) (*TokenPair, error) {
-	at, err := m.generateAccessToken(userID, extraClaims)
+func (m *Manager) GenerateTokenPair(userID int64, extra map[string]interface{}) (*TokenPair, error) {
+	at, err := m.generateAccessToken(userID, extra)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +56,6 @@ func (m *Manager) GenerateTokenPair(userID int64, extraClaims map[string]interfa
 		RefreshToken: rt,
 		ExpiresIn:    int64(m.accessTTL.Seconds()),
 	}, nil
-
 }
 
 func (m *Manager) generateAccessToken(userID int64, extra map[string]interface{}) (string, error) {
@@ -73,7 +72,6 @@ func (m *Manager) generateAccessToken(userID int64, extra map[string]interface{}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString(m.secret)
-
 }
 
 func (m *Manager) generateRefreshToken(userID int64) (string, error) {
@@ -82,12 +80,11 @@ func (m *Manager) generateRefreshToken(userID int64) (string, error) {
 		"type":    "refresh",
 		"exp":     time.Now().Add(m.refreshTTL).Unix(),
 		"iat":     time.Now().Unix(),
-		"jti":     fmt.Sprintf("%d-%d", userID, time.Now().UnixNano()), // уникальный идентификатор
+		"jti":     fmt.Sprintf("%d-%d", userID, time.Now().UnixNano()),
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString(m.secret)
-
 }
 
 // --------------------
@@ -104,6 +101,7 @@ func (m *Manager) ValidateAccessToken(tokenStr string) (int64, map[string]interf
 	if err != nil {
 		return 0, nil, err
 	}
+
 	if !parsed.Valid {
 		return 0, nil, errors.New("invalid token")
 	}
@@ -113,11 +111,14 @@ func (m *Manager) ValidateAccessToken(tokenStr string) (int64, map[string]interf
 		return 0, nil, errors.New("invalid claims")
 	}
 
+	if claims["type"] != "access" {
+		return 0, nil, errors.New("not access token")
+	}
+
 	userIDf, ok := claims["user_id"].(float64)
 	if !ok {
 		return 0, nil, errors.New("user_id not found")
 	}
-	userID := int64(userIDf)
 
 	extras := make(map[string]interface{})
 	for k, v := range claims {
@@ -127,11 +128,10 @@ func (m *Manager) ValidateAccessToken(tokenStr string) (int64, map[string]interf
 		extras[k] = v
 	}
 
-	return userID, extras, nil
-
+	return int64(userIDf), extras, nil
 }
 
-func (m *Manager) ValidateRefreshToken(tokenStr string) (int64, error) {
+func (m *Manager) ValidateRefreshToken(tokenStr string) (userID int64, jti string, exp int64, err error) {
 	parsed, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
 		if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
@@ -139,29 +139,30 @@ func (m *Manager) ValidateRefreshToken(tokenStr string) (int64, error) {
 		return m.secret, nil
 	})
 	if err != nil {
-		return 0, err
+		return 0, "", 0, err
 	}
+
 	if !parsed.Valid {
-		return 0, errors.New("invalid refresh token")
+		err = errors.New("invalid refresh token")
+		return
 	}
 
 	claims, ok := parsed.Claims.(jwt.MapClaims)
 	if !ok {
-		return 0, errors.New("invalid claims")
+		err = errors.New("invalid claims")
+		return
 	}
 
-	typ, ok := claims["type"].(string)
-	if !ok || typ != "refresh" {
-		return 0, errors.New("token is not a refresh token")
+	if claims["type"] != "refresh" {
+		err = errors.New("not refresh token")
+		return
 	}
 
-	userIDf, ok := claims["user_id"].(float64)
-	if !ok {
-		return 0, errors.New("user_id not found")
-	}
+	userID = int64(claims["user_id"].(float64))
+	jti = claims["jti"].(string)
+	exp = int64(claims["exp"].(float64))
 
-	return int64(userIDf), nil
-
+	return
 }
 
 // --------------------
@@ -171,4 +172,20 @@ func (m *Manager) ValidateRefreshToken(tokenStr string) (int64, error) {
 func HashToken(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])
+}
+
+func GetExp(tokenStr string) (int64, error) {
+	tok, _, err := new(jwt.Parser).ParseUnverified(tokenStr, jwt.MapClaims{})
+	if err != nil {
+		return 0, err
+	}
+
+	claims := tok.Claims.(jwt.MapClaims)
+
+	expf, ok := claims["exp"].(float64)
+	if !ok {
+		return 0, errors.New("exp not found")
+	}
+
+	return int64(expf), nil
 }

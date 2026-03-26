@@ -25,7 +25,7 @@ func TestTokenPairGenerationValidation(t *testing.T) {
 		t.Fatalf("extra claim missing")
 	}
 
-	uid2, err := mgr.ValidateRefreshToken(pair.RefreshToken)
+	uid2, _, _, err := mgr.ValidateRefreshToken(pair.RefreshToken)
 	if err != nil {
 		t.Fatalf("refresh validation failed: %v", err)
 	}
