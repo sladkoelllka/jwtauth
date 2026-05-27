@@ -3,6 +3,7 @@ package jwtauth
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -22,6 +23,20 @@ type TokenPair struct {
 	ExpiresIn    int64  `json:"expires_in"`
 }
 
+type AccessTokenClaims struct {
+	UserID    int64
+	IssuedAt  int64
+	ExpiresAt int64
+	Extra     map[string]interface{}
+}
+
+type RefreshTokenClaims struct {
+	UserID    int64
+	JTI       string
+	IssuedAt  int64
+	ExpiresAt int64
+}
+
 func NewManager(secret string) *Manager {
 	return &Manager{
 		secret:     []byte(secret),
@@ -35,10 +50,6 @@ func (m *Manager) WithDurations(access, refresh time.Duration) *Manager {
 	m.refreshTTL = refresh
 	return m
 }
-
-// --------------------
-// Генерация токенов
-// --------------------
 
 func (m *Manager) GenerateTokenPair(userID int64, extra map[string]interface{}) (*TokenPair, error) {
 	at, err := m.generateAccessToken(userID, extra)
@@ -67,7 +78,7 @@ func (m *Manager) generateAccessToken(userID int64, extra map[string]interface{}
 	}
 
 	for k, v := range extra {
-		claims[k] = v
+		claims[k] = normalizeValue(v)
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -87,11 +98,16 @@ func (m *Manager) generateRefreshToken(userID int64) (string, error) {
 	return token.SignedString(m.secret)
 }
 
-// --------------------
-// Валидация токенов
-// --------------------
-
 func (m *Manager) ValidateAccessToken(tokenStr string) (int64, map[string]interface{}, error) {
+	claims, err := m.ValidateAccessTokenDetailed(tokenStr)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	return claims.UserID, claims.Extra, nil
+}
+
+func (m *Manager) ValidateAccessTokenDetailed(tokenStr string) (*AccessTokenClaims, error) {
 	parsed, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
 		if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
@@ -99,25 +115,35 @@ func (m *Manager) ValidateAccessToken(tokenStr string) (int64, map[string]interf
 		return m.secret, nil
 	})
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 
 	if !parsed.Valid {
-		return 0, nil, errors.New("invalid token")
+		return nil, errors.New("invalid token")
 	}
 
 	claims, ok := parsed.Claims.(jwt.MapClaims)
 	if !ok {
-		return 0, nil, errors.New("invalid claims")
+		return nil, errors.New("invalid claims")
 	}
 
 	if claims["type"] != "access" {
-		return 0, nil, errors.New("not access token")
+		return nil, errors.New("not access token")
 	}
 
-	userIDf, ok := claims["user_id"].(float64)
-	if !ok {
-		return 0, nil, errors.New("user_id not found")
+	userID, err := claimInt64(claims, "user_id")
+	if err != nil {
+		return nil, err
+	}
+
+	iat, err := claimInt64(claims, "iat")
+	if err != nil {
+		return nil, err
+	}
+
+	exp, err := claimInt64(claims, "exp")
+	if err != nil {
+		return nil, err
 	}
 
 	extras := make(map[string]interface{})
@@ -125,13 +151,27 @@ func (m *Manager) ValidateAccessToken(tokenStr string) (int64, map[string]interf
 		if k == "user_id" || k == "type" || k == "exp" || k == "iat" || k == "jti" {
 			continue
 		}
-		extras[k] = v
+		extras[k] = normalizeValue(v)
 	}
 
-	return int64(userIDf), extras, nil
+	return &AccessTokenClaims{
+		UserID:    userID,
+		IssuedAt:  iat,
+		ExpiresAt: exp,
+		Extra:     extras,
+	}, nil
 }
 
 func (m *Manager) ValidateRefreshToken(tokenStr string) (userID int64, jti string, exp int64, err error) {
+	claims, err := m.ValidateRefreshTokenDetailed(tokenStr)
+	if err != nil {
+		return 0, "", 0, err
+	}
+
+	return claims.UserID, claims.JTI, claims.ExpiresAt, nil
+}
+
+func (m *Manager) ValidateRefreshTokenDetailed(tokenStr string) (*RefreshTokenClaims, error) {
 	parsed, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
 		if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
@@ -139,35 +179,49 @@ func (m *Manager) ValidateRefreshToken(tokenStr string) (userID int64, jti strin
 		return m.secret, nil
 	})
 	if err != nil {
-		return 0, "", 0, err
+		return nil, err
 	}
 
 	if !parsed.Valid {
-		err = errors.New("invalid refresh token")
-		return
+		return nil, errors.New("invalid refresh token")
 	}
 
 	claims, ok := parsed.Claims.(jwt.MapClaims)
 	if !ok {
-		err = errors.New("invalid claims")
-		return
+		return nil, errors.New("invalid claims")
 	}
 
 	if claims["type"] != "refresh" {
-		err = errors.New("not refresh token")
-		return
+		return nil, errors.New("not refresh token")
 	}
 
-	userID = int64(claims["user_id"].(float64))
-	jti = claims["jti"].(string)
-	exp = int64(claims["exp"].(float64))
+	userID, err := claimInt64(claims, "user_id")
+	if err != nil {
+		return nil, err
+	}
 
-	return
+	jti, ok := claims["jti"].(string)
+	if !ok || jti == "" {
+		return nil, errors.New("jti not found")
+	}
+
+	iat, err := claimInt64(claims, "iat")
+	if err != nil {
+		return nil, err
+	}
+
+	exp, err := claimInt64(claims, "exp")
+	if err != nil {
+		return nil, err
+	}
+
+	return &RefreshTokenClaims{
+		UserID:    userID,
+		JTI:       jti,
+		IssuedAt:  iat,
+		ExpiresAt: exp,
+	}, nil
 }
-
-// --------------------
-// HashToken для blacklist
-// --------------------
 
 func HashToken(token string) string {
 	h := sha256.Sum256([]byte(token))
@@ -188,4 +242,61 @@ func GetExp(tokenStr string) (int64, error) {
 	}
 
 	return int64(expf), nil
+}
+
+func claimInt64(claims jwt.MapClaims, name string) (int64, error) {
+	v, ok := claims[name]
+	if !ok {
+		return 0, fmt.Errorf("%s not found", name)
+	}
+
+	switch val := v.(type) {
+	case float64:
+		return int64(val), nil
+	case int64:
+		return val, nil
+	case int:
+		return int64(val), nil
+	case json.Number:
+		return val.Int64()
+	default:
+		return 0, fmt.Errorf("%s not found", name)
+	}
+}
+
+func normalizeValue(v interface{}) interface{} {
+	switch val := v.(type) {
+	case int:
+		return int64(val)
+	case int8:
+		return int64(val)
+	case int16:
+		return int64(val)
+	case int32:
+		return int64(val)
+	case int64:
+		return val
+	case uint:
+		return int64(val)
+	case uint8:
+		return int64(val)
+	case uint16:
+		return int64(val)
+	case uint32:
+		return int64(val)
+	case uint64:
+		return int64(val)
+	case float32:
+		if val == float32(int64(val)) {
+			return int64(val)
+		}
+		return float64(val)
+	case float64:
+		if val == float64(int64(val)) {
+			return int64(val)
+		}
+		return val
+	default:
+		return v
+	}
 }

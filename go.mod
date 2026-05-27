@@ -1,4 +1,4 @@
-module github.com/sladkoelllka/jwtauth
+module gitlab.legion.devel/common-backend/jwtauth
 
 go 1.25.5
 

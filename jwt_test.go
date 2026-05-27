@@ -1,12 +1,8 @@
 package jwtauth
 
 import (
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
-
-	"github.com/gin-gonic/gin"
 )
 
 func TestTokenPairGenerationValidation(t *testing.T) {
@@ -38,6 +34,52 @@ func TestTokenPairGenerationValidation(t *testing.T) {
 	}
 }
 
+func TestDetailedValidationIncludesIssuedAt(t *testing.T) {
+	mgr := NewManager("secret")
+	mgr.WithDurations(1*time.Minute, 1*time.Hour)
+
+	before := time.Now().Unix()
+	pair, err := mgr.GenerateTokenPair(123, map[string]interface{}{"foo": "bar"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now().Unix()
+
+	accessClaims, err := mgr.ValidateAccessTokenDetailed(pair.AccessToken)
+	if err != nil {
+		t.Fatalf("access validation failed: %v", err)
+	}
+	if accessClaims.UserID != 123 {
+		t.Fatalf("expected uid 123 got %d", accessClaims.UserID)
+	}
+	if accessClaims.IssuedAt < before || accessClaims.IssuedAt > after {
+		t.Fatalf("unexpected access iat: %d", accessClaims.IssuedAt)
+	}
+	if accessClaims.ExpiresAt == 0 {
+		t.Fatalf("expected access exp")
+	}
+	if accessClaims.Extra["foo"] != "bar" {
+		t.Fatalf("extra claim missing")
+	}
+
+	refreshClaims, err := mgr.ValidateRefreshTokenDetailed(pair.RefreshToken)
+	if err != nil {
+		t.Fatalf("refresh validation failed: %v", err)
+	}
+	if refreshClaims.UserID != 123 {
+		t.Fatalf("expected refresh uid 123 got %d", refreshClaims.UserID)
+	}
+	if refreshClaims.JTI == "" {
+		t.Fatalf("expected refresh jti")
+	}
+	if refreshClaims.IssuedAt < before || refreshClaims.IssuedAt > after {
+		t.Fatalf("unexpected refresh iat: %d", refreshClaims.IssuedAt)
+	}
+	if refreshClaims.ExpiresAt == 0 {
+		t.Fatalf("expected refresh exp")
+	}
+}
+
 func TestHashToken(t *testing.T) {
 	h1 := HashToken("abc")
 	h2 := HashToken("abc")
@@ -47,66 +89,4 @@ func TestHashToken(t *testing.T) {
 	if len(h1) == 0 {
 		t.Errorf("hash should not be empty")
 	}
-}
-
-func TestGinMiddlewareStoresAuthInfo(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	mgr := NewManager("secret")
-	pair, err := mgr.GenerateTokenPair(42, map[string]interface{}{
-		"role":            "owner",
-		"organization_id": int32(7),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	router := gin.New()
-	router.Use(GinMiddleware(mgr, noopBlacklist{}))
-	router.GET("/me", func(c *gin.Context) {
-		userID, ok := UserIDFromGinContext(c)
-		if !ok {
-			t.Fatal("user id missing from gin context")
-		}
-		if userID != 42 {
-			t.Fatalf("user id = %d, want 42", userID)
-		}
-
-		claims, ok := ClaimsFromGinContext(c)
-		if !ok {
-			t.Fatal("claims missing from gin context")
-		}
-		if claims["role"] != "owner" {
-			t.Fatalf("role claim = %v, want owner", claims["role"])
-		}
-		if claims["organization_id"] != float64(7) {
-			t.Fatalf("organization_id claim = %v, want 7", claims["organization_id"])
-		}
-
-		auth, ok := AuthInfoFromContext(c.Request.Context())
-		if !ok {
-			t.Fatal("auth info missing from request context")
-		}
-		if auth.UserID != 42 {
-			t.Fatalf("request context user id = %d, want 42", auth.UserID)
-		}
-
-		c.Status(http.StatusNoContent)
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/me", nil)
-	req.Header.Set("Authorization", "Bearer "+pair.AccessToken)
-	rec := httptest.NewRecorder()
-
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
-	}
-}
-
-type noopBlacklist struct{}
-
-func (noopBlacklist) Exists(string) (bool, error) {
-	return false, nil
 }

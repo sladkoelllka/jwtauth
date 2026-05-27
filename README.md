@@ -5,7 +5,8 @@
 * генерация access и refresh токенов
 * валидация токенов
 * интеграция с Gin через middleware
-* blacklist для отзыва токенов (Redis)
+* blacklist для отзыва конкретного access-токена через Redis
+* отзыв всех токенов пользователя по `iat` через Redis
 * извлечение `userID` из контекста
 
 ---
@@ -45,10 +46,6 @@ tokens, err := mgr.GenerateTokenPair(userID, extraClaims)
 if err != nil {
     // обработка ошибки
 }
-
-fmt.Println("Access:", tokens.AccessToken)
-fmt.Println("Refresh:", tokens.RefreshToken)
-fmt.Println("ExpiresIn:", tokens.ExpiresIn)
 ```
 
 ---
@@ -62,61 +59,103 @@ userID, extras, err := mgr.ValidateAccessToken(tokens.AccessToken)
 if err != nil {
     // токен недействителен
 }
-fmt.Println(userID, extras)
 ```
 
 ### Refresh-токен
 
 ```go
-userID, err := mgr.ValidateRefreshToken(tokens.RefreshToken)
+userID, jti, exp, err := mgr.ValidateRefreshToken(tokens.RefreshToken)
 if err != nil {
     // refresh токен недействителен
 }
 ```
 
+Для проверки отзыва токенов пользователя используйте detailed-методы:
+
+```go
+accessClaims, err := mgr.ValidateAccessTokenDetailed(tokens.AccessToken)
+refreshClaims, err := mgr.ValidateRefreshTokenDetailed(tokens.RefreshToken)
+```
+
+Они возвращают `iat`, по которому можно понять, был ли токен выпущен до блокировки пользователя.
+
 ---
 
-## 4. Blacklist (отзыв токенов)
+## 4. Blacklist
 
-Создание blacklist с TTL:
+Blacklist отзывает конкретный access-токен, например при logout.
 
 ```go
 redisClient := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-bl := jwtauth.NewBlacklist(redisClient, 24*time.Hour)
-```
+bl := jwtauth.NewBlacklist(redisClient)
 
-Добавление токена в blacklist:
-
-```go
-err := bl.Add(tokens.AccessToken)
+exp, err := jwtauth.GetExp(tokens.AccessToken)
+if err == nil {
+    err = bl.Add(tokens.AccessToken, exp)
+}
 ```
 
 Проверка наличия токена в blacklist:
 
 ```go
-blocked, _ := bl.Exists(tokens.AccessToken)
+blocked, err := bl.Exists(tokens.AccessToken)
+if err != nil {
+    // ошибка Redis
+}
 if blocked {
-    fmt.Println("Token revoked")
+    // token revoked
 }
 ```
 
-Удаление токена из blacklist:
-
-```go
-bl.Remove(tokens.AccessToken)
-```
-
-> Примечание: токены хранятся в Redis в виде SHA256-хэша для безопасности.
+Токены хранятся в Redis в виде SHA256-хэша.
 
 ---
 
-## 5. Gin Middleware
+## 5. Отзыв всех токенов пользователя
+
+Для блокировки пользователя используйте `UserRevocationStore`. Он хранит timestamp, до которого все токены пользователя считаются отозванными.
+
+```go
+revocations := jwtauth.NewUserRevocationStore(redisClient)
+err := revocations.RevokeUser(userID, time.Now())
+```
+
+По умолчанию запись хранится без TTL. Если в вашем сценарии нужен срок хранения, задайте его явно:
+
+```go
+revocations.WithTTL(31 * 24 * time.Hour)
+```
+
+Проверка access-токена:
+
+```go
+claims, err := mgr.ValidateAccessTokenDetailed(accessToken)
+if err != nil {
+    // токен недействителен
+}
+
+revoked, err := revocations.IsRevoked(claims.UserID, claims.IssuedAt)
+if err != nil {
+    // ошибка Redis
+}
+if revoked {
+    // токен был выпущен до блокировки пользователя
+}
+```
+
+При разблокировке пользователя не удаляйте revocation-запись: старые токены не должны оживать. Пользователь должен получить новую пару токенов через login.
+
+---
+
+## 6. Gin Middleware
 
 Подключение middleware к маршрутам Gin:
 
 ```go
 r := gin.Default()
-r.Use(jwtauth.GinMiddleware(mgr))
+bl := jwtauth.NewBlacklist(redisClient)
+revocations := jwtauth.NewUserRevocationStore(redisClient)
+r.Use(jwtauth.GinMiddlewareWithUserRevocation(mgr, bl, revocations))
 
 r.GET("/private", func(c *gin.Context) {
     userID, ok := jwtauth.UserIDFromGinContext(c)
@@ -132,18 +171,9 @@ Middleware проверяет:
 
 * наличие заголовка `Authorization: Bearer <token>`
 * корректность подписи и срок действия токена
+* blacklist конкретного access-токена
+* отзыв всех токенов пользователя через `UserRevocationStore`
 * помещает `user_id` в контекст Gin (`c.Set("user_id", userID)`)
-
----
-
-## 6. Хэширование токена
-
-Для безопасного хранения в blacklist:
-
-```go
-hash := jwtauth.HashToken(tokens.AccessToken)
-fmt.Println(hash)
-```
 
 ---
 
@@ -165,8 +195,8 @@ userID, ok := jwtauth.UserIDFromGinContext(c)
 
 ## Рекомендации по использованию
 
-* Для доступа к защищённым маршрутам всегда используйте Gin middleware.
-* Для отзыва токенов используйте blacklist и проверяйте перед выдачей доступа.
-* Всегда валидируйте refresh-токены через `ValidateRefreshToken`.
-* Храните секрет JWT в безопасном месте (env, Vault, secrets manager).
-* Для production можно добавлять уникальный `jti` в refresh-токены для идентификации.
+* Для доступа к защищённым маршрутам используйте Gin middleware.
+* Для logout используйте blacklist конкретного access-токена.
+* Для блокировки пользователя используйте `UserRevocationStore`, а не blacklist.
+* Всегда валидируйте refresh-токены через `ValidateRefreshToken` или `ValidateRefreshTokenDetailed`.
+* Храните секрет JWT в безопасном месте: env, Vault или secrets manager.
