@@ -14,7 +14,7 @@
 ## Установка
 
 ```go
-import "gitlab.legion.devel/common-backend/jwtauth"
+import "github.com/sladkoelllka/jwtauth"
 ```
 
 ---
