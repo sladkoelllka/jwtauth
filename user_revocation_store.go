@@ -2,6 +2,7 @@ package jwtauth
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"time"
 
@@ -39,7 +40,7 @@ func (s *UserRevocationStore) RevokedBeforeContext(ctx context.Context, userID i
 	}
 	val, err := s.client.Get(ctx, s.key(userID)).Result()
 	if err != nil {
-		if err == redis.Nil {
+		if errors.Is(err, redis.Nil) {
 			return 0, nil
 		}
 		return 0, err

@@ -1,29 +1,29 @@
 # jwtauth
 
-`jwtauth` is a small production-oriented package for access-token authentication in Go services.
+`jwtauth` — это небольшой production-oriented пакет для аутентификации по access-токенам в Go-сервисах.
 
-The package intentionally handles only:
+Пакет намеренно отвечает только за:
 
-* short-lived JWT access tokens
-* opaque refresh token generation
-* token hashing
-* Redis-backed access token blacklist
-* Redis-backed user-wide revocation by `iat`
-* Gin middleware helpers
+* короткоживущие JWT access-токены;
+* генерацию opaque refresh-токенов;
+* хеширование токенов;
+* blacklist access-токенов на базе Redis;
+* отзыв всех токенов пользователя по `iat` на базе Redis;
+* вспомогательные middleware для Gin.
 
-Refresh token persistence and rotation must live in the application auth/session layer.
-Store only refresh token hashes in your database.
+Хранение и ротация refresh-токенов должны находиться на уровне auth/session-слоя приложения.
+В базе данных храните только хеши refresh-токенов.
 
-## Token Model
+## Модель токенов
 
-Recommended flow:
+Рекомендуемый flow:
 
-* access token: JWT, short TTL, stateless validation
-* refresh token: opaque random string, stored as hash in DB
-* logout current session: revoke DB session and blacklist current access token until `exp`
-* logout all/password change: revoke DB sessions and set user revocation timestamp in Redis
+* access token: JWT, короткий TTL, stateless-валидация;
+* refresh token: opaque random string, хранится в БД в виде хеша;
+* logout текущей сессии: отозвать DB-сессию и добавить текущий access-токен в blacklist до его `exp`;
+* logout со всех устройств / смена пароля: отозвать DB-сессии и установить timestamp отзыва пользователя в Redis.
 
-Do not put private profile, role, couple, or relationship data into access token claims unless stale data is explicitly acceptable.
+Не кладите приватные данные профиля, роли, пары или отношений в claims access-токена, если устаревание этих данных явно не является допустимым.
 
 ## Manager
 
@@ -36,7 +36,7 @@ mgr := jwtauth.NewManager(jwtauth.Options{
 })
 ```
 
-Generate an access token:
+Сгенерировать access-токен:
 
 ```go
 accessToken, err := mgr.GenerateAccessToken(userID, jwtauth.AccessTokenOptions{
@@ -47,7 +47,7 @@ accessToken, err := mgr.GenerateAccessToken(userID, jwtauth.AccessTokenOptions{
 })
 ```
 
-Validate an access token:
+Проверить access-токен:
 
 ```go
 claims, err := mgr.ValidateAccessTokenDetailed(accessToken)
@@ -59,9 +59,9 @@ userID := claims.UserID
 sessionID := claims.SessionID
 ```
 
-## Refresh Tokens
+## Refresh-токены
 
-Generate an opaque refresh token:
+Сгенерировать opaque refresh-токен:
 
 ```go
 refreshToken, err := jwtauth.GenerateOpaqueRefreshToken()
@@ -72,7 +72,7 @@ if err != nil {
 refreshTokenHash := jwtauth.HashToken(refreshToken)
 ```
 
-Persist only the hash:
+Храните только хеш:
 
 ```sql
 INSERT INTO auth_sessions (
@@ -82,18 +82,18 @@ INSERT INTO auth_sessions (
 ) VALUES ($1, $2, $3);
 ```
 
-On refresh:
+При refresh:
 
-1. hash the provided refresh token
-2. load and lock the DB session by hash
-3. verify the session is active and not expired
-4. generate a new opaque refresh token
-5. replace the old hash with the new hash in the same transaction
-6. issue a new access token
+1. захешировать переданный refresh-токен;
+2. загрузить и заблокировать DB-сессию по хешу;
+3. проверить, что сессия активна и не истекла;
+4. сгенерировать новый opaque refresh-токен;
+5. заменить старый хеш новым в рамках той же транзакции;
+6. выпустить новый access-токен.
 
 ## Blacklist
 
-Blacklist is for revoking a concrete access token until its expiration.
+Blacklist нужен для отзыва конкретного access-токена до момента его истечения.
 
 ```go
 blacklist := jwtauth.NewBlacklist(redisClient)
@@ -108,18 +108,19 @@ if err := blacklist.AddContext(ctx, accessToken, exp); err != nil {
 }
 ```
 
-Check blacklist:
+Проверить blacklist:
 
 ```go
 blocked, err := blacklist.ExistsContext(ctx, accessToken)
 ```
 
-Tokens are stored in Redis as SHA-256 hashes.
+Токены хранятся в Redis в виде SHA-256 хешей.
 
-## User Revocation
+## Отзыв токенов пользователя
 
-Use `UserRevocationStore` to invalidate all access tokens issued before a point in time.
-This is useful for logout-all, password change, account lock, and security events.
+Используйте `UserRevocationStore`, чтобы инвалидировать все access-токены, выпущенные до определенного момента времени.
+
+Это полезно для logout со всех устройств, смены пароля, блокировки аккаунта и событий безопасности.
 
 ```go
 revocations := jwtauth.NewUserRevocationStore(redisClient).
@@ -130,7 +131,7 @@ if err := revocations.RevokeUserContext(ctx, userID, time.Now()); err != nil {
 }
 ```
 
-Check revocation:
+Проверить отзыв:
 
 ```go
 revoked, err := revocations.IsRevokedContext(ctx, claims.UserID, claims.IssuedAt)
@@ -157,24 +158,24 @@ r.GET("/private", func(c *gin.Context) {
 })
 ```
 
-The middleware checks:
+Middleware проверяет:
 
-* exact `Authorization: Bearer <token>` format
-* JWT signature and expiration
-* token type is `access`
-* optional issuer and audience
-* concrete access-token blacklist
-* user-wide revocation timestamp
+* точный формат `Authorization: Bearer <token>`;
+* подпись JWT и срок действия;
+* что тип токена — `access`;
+* опциональные issuer и audience;
+* blacklist конкретного access-токена;
+* timestamp отзыва всех токенов пользователя.
 
-## Errors
+## Ошибки
 
-The package exposes sentinel errors:
+Пакет предоставляет sentinel errors:
 
-* `ErrMissingToken`
-* `ErrInvalidToken`
-* `ErrInvalidTokenType`
-* `ErrTokenRevoked`
-* `ErrTokenExpired`
-* `ErrInvalidBearerToken`
+* `ErrMissingToken`;
+* `ErrInvalidToken`;
+* `ErrInvalidTokenType`;
+* `ErrTokenRevoked`;
+* `ErrTokenExpired`;
+* `ErrInvalidBearerToken`.
 
-Use `errors.Is` to classify them.
+Используйте `errors.Is`, чтобы классифицировать эти ошибки.
