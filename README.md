@@ -1,161 +1,150 @@
-# Пакет `jwtauth`
+# jwtauth
 
-Пакет `jwtauth` предоставляет удобный и безопасный способ работы с JWT-токенами:
+`jwtauth` is a small production-oriented package for access-token authentication in Go services.
 
-* генерация access и refresh токенов
-* валидация токенов
-* интеграция с Gin через middleware
-* blacklist для отзыва конкретного access-токена через Redis
-* отзыв всех токенов пользователя по `iat` через Redis
-* извлечение `userID` из контекста
+The package intentionally handles only:
 
----
+* short-lived JWT access tokens
+* opaque refresh token generation
+* token hashing
+* Redis-backed access token blacklist
+* Redis-backed user-wide revocation by `iat`
+* Gin middleware helpers
 
-## Установка
+Refresh token persistence and rotation must live in the application auth/session layer.
+Store only refresh token hashes in your database.
 
-```go
-import "github.com/sladkoelllka/jwtauth"
-```
+## Token Model
 
----
+Recommended flow:
 
-## 1. Создание менеджера токенов
+* access token: JWT, short TTL, stateless validation
+* refresh token: opaque random string, stored as hash in DB
+* logout current session: revoke DB session and blacklist current access token until `exp`
+* logout all/password change: revoke DB sessions and set user revocation timestamp in Redis
 
-```go
-secret := "supersecretkey"
-mgr := jwtauth.NewManager(secret)
-```
+Do not put private profile, role, couple, or relationship data into access token claims unless stale data is explicitly acceptable.
 
-Настройка TTL для токенов:
-
-```go
-mgr.WithDurations(30*time.Minute, 60*24*time.Hour) // access=30мин, refresh=60дн
-```
-
----
-
-## 2. Генерация токенов
+## Manager
 
 ```go
-userID := int64(42)
-extraClaims := map[string]interface{}{
-    "role": "admin",
-}
-
-tokens, err := mgr.GenerateTokenPair(userID, extraClaims)
-if err != nil {
-    // обработка ошибки
-}
+mgr := jwtauth.NewManager(jwtauth.Options{
+    Secret:    os.Getenv("JWT_SECRET"),
+    AccessTTL: 15 * time.Minute,
+    Issuer:    "relationship-companion-api",
+    Audience:  []string{"mobile"},
+})
 ```
 
----
-
-## 3. Валидация токенов
-
-### Access-токен
+Generate an access token:
 
 ```go
-userID, extras, err := mgr.ValidateAccessToken(tokens.AccessToken)
-if err != nil {
-    // токен недействителен
-}
+accessToken, err := mgr.GenerateAccessToken(userID, jwtauth.AccessTokenOptions{
+    SessionID: sessionID,
+    Extra: map[string]interface{}{
+        "client": "telegram-mini-app",
+    },
+})
 ```
 
-### Refresh-токен
-
-```go
-userID, jti, exp, err := mgr.ValidateRefreshToken(tokens.RefreshToken)
-if err != nil {
-    // refresh токен недействителен
-}
-```
-
-Для проверки отзыва токенов пользователя используйте detailed-методы:
-
-```go
-accessClaims, err := mgr.ValidateAccessTokenDetailed(tokens.AccessToken)
-refreshClaims, err := mgr.ValidateRefreshTokenDetailed(tokens.RefreshToken)
-```
-
-Они возвращают `iat`, по которому можно понять, был ли токен выпущен до блокировки пользователя.
-
----
-
-## 4. Blacklist
-
-Blacklist отзывает конкретный access-токен, например при logout.
-
-```go
-redisClient := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-bl := jwtauth.NewBlacklist(redisClient)
-
-exp, err := jwtauth.GetExp(tokens.AccessToken)
-if err == nil {
-    err = bl.Add(tokens.AccessToken, exp)
-}
-```
-
-Проверка наличия токена в blacklist:
-
-```go
-blocked, err := bl.Exists(tokens.AccessToken)
-if err != nil {
-    // ошибка Redis
-}
-if blocked {
-    // token revoked
-}
-```
-
-Токены хранятся в Redis в виде SHA256-хэша.
-
----
-
-## 5. Отзыв всех токенов пользователя
-
-Для блокировки пользователя используйте `UserRevocationStore`. Он хранит timestamp, до которого все токены пользователя считаются отозванными.
-
-```go
-revocations := jwtauth.NewUserRevocationStore(redisClient)
-err := revocations.RevokeUser(userID, time.Now())
-```
-
-По умолчанию запись хранится без TTL. Если в вашем сценарии нужен срок хранения, задайте его явно:
-
-```go
-revocations.WithTTL(31 * 24 * time.Hour)
-```
-
-Проверка access-токена:
+Validate an access token:
 
 ```go
 claims, err := mgr.ValidateAccessTokenDetailed(accessToken)
 if err != nil {
-    // токен недействителен
+    return err
 }
 
-revoked, err := revocations.IsRevoked(claims.UserID, claims.IssuedAt)
+userID := claims.UserID
+sessionID := claims.SessionID
+```
+
+## Refresh Tokens
+
+Generate an opaque refresh token:
+
+```go
+refreshToken, err := jwtauth.GenerateOpaqueRefreshToken()
 if err != nil {
-    // ошибка Redis
+    return err
 }
-if revoked {
-    // токен был выпущен до блокировки пользователя
+
+refreshTokenHash := jwtauth.HashToken(refreshToken)
+```
+
+Persist only the hash:
+
+```sql
+INSERT INTO auth_sessions (
+    user_id,
+    refresh_token_hash,
+    refresh_token_expires_at
+) VALUES ($1, $2, $3);
+```
+
+On refresh:
+
+1. hash the provided refresh token
+2. load and lock the DB session by hash
+3. verify the session is active and not expired
+4. generate a new opaque refresh token
+5. replace the old hash with the new hash in the same transaction
+6. issue a new access token
+
+## Blacklist
+
+Blacklist is for revoking a concrete access token until its expiration.
+
+```go
+blacklist := jwtauth.NewBlacklist(redisClient)
+
+exp, err := jwtauth.GetExp(accessToken)
+if err != nil {
+    return err
+}
+
+if err := blacklist.AddContext(ctx, accessToken, exp); err != nil {
+    return err
 }
 ```
 
-При разблокировке пользователя не удаляйте revocation-запись: старые токены не должны оживать. Пользователь должен получить новую пару токенов через login.
+Check blacklist:
 
----
+```go
+blocked, err := blacklist.ExistsContext(ctx, accessToken)
+```
 
-## 6. Gin Middleware
+Tokens are stored in Redis as SHA-256 hashes.
 
-Подключение middleware к маршрутам Gin:
+## User Revocation
+
+Use `UserRevocationStore` to invalidate all access tokens issued before a point in time.
+This is useful for logout-all, password change, account lock, and security events.
+
+```go
+revocations := jwtauth.NewUserRevocationStore(redisClient).
+    WithTTL(31 * 24 * time.Hour)
+
+if err := revocations.RevokeUserContext(ctx, userID, time.Now()); err != nil {
+    return err
+}
+```
+
+Check revocation:
+
+```go
+revoked, err := revocations.IsRevokedContext(ctx, claims.UserID, claims.IssuedAt)
+```
+
+## Gin Middleware
 
 ```go
 r := gin.Default()
-bl := jwtauth.NewBlacklist(redisClient)
+
+blacklist := jwtauth.NewBlacklist(redisClient)
 revocations := jwtauth.NewUserRevocationStore(redisClient)
-r.Use(jwtauth.GinMiddlewareWithUserRevocation(mgr, bl, revocations))
+
+r.Use(jwtauth.GinMiddlewareWithUserRevocation(mgr, blacklist, revocations))
 
 r.GET("/private", func(c *gin.Context) {
     userID, ok := jwtauth.UserIDFromGinContext(c)
@@ -163,40 +152,29 @@ r.GET("/private", func(c *gin.Context) {
         c.JSON(401, gin.H{"error": "user not found"})
         return
     }
+
     c.JSON(200, gin.H{"user_id": userID})
 })
 ```
 
-Middleware проверяет:
+The middleware checks:
 
-* наличие заголовка `Authorization: Bearer <token>`
-* корректность подписи и срок действия токена
-* blacklist конкретного access-токена
-* отзыв всех токенов пользователя через `UserRevocationStore`
-* помещает `user_id` в контекст Gin (`c.Set("user_id", userID)`)
+* exact `Authorization: Bearer <token>` format
+* JWT signature and expiration
+* token type is `access`
+* optional issuer and audience
+* concrete access-token blacklist
+* user-wide revocation timestamp
 
----
+## Errors
 
-## 7. Извлечение userID из контекста
+The package exposes sentinel errors:
 
-### Стандартный `context.Context`
+* `ErrMissingToken`
+* `ErrInvalidToken`
+* `ErrInvalidTokenType`
+* `ErrTokenRevoked`
+* `ErrTokenExpired`
+* `ErrInvalidBearerToken`
 
-```go
-userID, ok := jwtauth.UserIDFromContext(ctx)
-```
-
-### Gin `*gin.Context`
-
-```go
-userID, ok := jwtauth.UserIDFromGinContext(c)
-```
-
----
-
-## Рекомендации по использованию
-
-* Для доступа к защищённым маршрутам используйте Gin middleware.
-* Для logout используйте blacklist конкретного access-токена.
-* Для блокировки пользователя используйте `UserRevocationStore`, а не blacklist.
-* Всегда валидируйте refresh-токены через `ValidateRefreshToken` или `ValidateRefreshTokenDetailed`.
-* Храните секрет JWT в безопасном месте: env, Vault или secrets manager.
+Use `errors.Is` to classify them.

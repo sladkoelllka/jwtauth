@@ -1,7 +1,9 @@
 package jwtauth
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,86 +14,80 @@ import (
 )
 
 type Manager struct {
-	secret     []byte
-	accessTTL  time.Duration
-	refreshTTL time.Duration
+	secret    []byte
+	accessTTL time.Duration
+	issuer    string
+	audience  []string
 }
 
-type TokenPair struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int64  `json:"expires_in"`
+type Options struct {
+	Secret    string
+	AccessTTL time.Duration
+	Issuer    string
+	Audience  []string
+}
+
+type AccessTokenOptions struct {
+	SessionID string
+	Extra     map[string]interface{}
 }
 
 type AccessTokenClaims struct {
 	UserID    int64
+	SessionID string
 	IssuedAt  int64
 	ExpiresAt int64
+	Issuer    string
+	Audience  []string
 	Extra     map[string]interface{}
 }
 
-type RefreshTokenClaims struct {
-	UserID    int64
-	JTI       string
-	IssuedAt  int64
-	ExpiresAt int64
-}
+func NewManager(opts Options) *Manager {
+	accessTTL := opts.AccessTTL
+	if accessTTL == 0 {
+		accessTTL = 15 * time.Minute
+	}
 
-func NewManager(secret string) *Manager {
 	return &Manager{
-		secret:     []byte(secret),
-		accessTTL:  15 * time.Minute,
-		refreshTTL: 30 * 24 * time.Hour,
+		secret:    []byte(opts.Secret),
+		accessTTL: accessTTL,
+		issuer:    opts.Issuer,
+		audience:  append([]string(nil), opts.Audience...),
 	}
 }
 
-func (m *Manager) WithDurations(access, refresh time.Duration) *Manager {
-	m.accessTTL = access
-	m.refreshTTL = refresh
-	return m
+func (m *Manager) AccessTTL() time.Duration {
+	return m.accessTTL
 }
 
-func (m *Manager) GenerateTokenPair(userID int64, extra map[string]interface{}) (*TokenPair, error) {
-	at, err := m.generateAccessToken(userID, extra)
-	if err != nil {
-		return nil, err
+func (m *Manager) GenerateAccessToken(userID int64, opts AccessTokenOptions) (string, error) {
+	if len(m.secret) == 0 {
+		return "", errors.New("jwt secret is empty")
 	}
 
-	rt, err := m.generateRefreshToken(userID)
-	if err != nil {
-		return nil, err
-	}
-
-	return &TokenPair{
-		AccessToken:  at,
-		RefreshToken: rt,
-		ExpiresIn:    int64(m.accessTTL.Seconds()),
-	}, nil
-}
-
-func (m *Manager) generateAccessToken(userID int64, extra map[string]interface{}) (string, error) {
+	now := time.Now()
 	claims := jwt.MapClaims{
 		"user_id": userID,
 		"type":    "access",
-		"exp":     time.Now().Add(m.accessTTL).Unix(),
-		"iat":     time.Now().Unix(),
+		"exp":     now.Add(m.accessTTL).Unix(),
+		"iat":     now.Unix(),
 	}
 
-	for k, v := range extra {
+	if opts.SessionID != "" {
+		claims["sid"] = opts.SessionID
+	}
+	if m.issuer != "" {
+		claims["iss"] = m.issuer
+	}
+	if len(m.audience) > 0 {
+		claims["aud"] = m.audience
+	}
+
+	for k, v := range opts.Extra {
+		if isReservedClaim(k) {
+			return "", fmt.Errorf("reserved claim %q", k)
+		}
 		claims[k] = normalizeValue(v)
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(m.secret)
-}
-
-func (m *Manager) generateRefreshToken(userID int64) (string, error) {
-	claims := jwt.MapClaims{
-		"user_id": userID,
-		"type":    "refresh",
-		"exp":     time.Now().Add(m.refreshTTL).Unix(),
-		"iat":     time.Now().Unix(),
-		"jti":     fmt.Sprintf("%d-%d", userID, time.Now().UnixNano()),
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -108,47 +104,51 @@ func (m *Manager) ValidateAccessToken(tokenStr string) (int64, map[string]interf
 }
 
 func (m *Manager) ValidateAccessTokenDetailed(tokenStr string) (*AccessTokenClaims, error) {
-	parsed, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
-		if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
+	if len(m.secret) == 0 {
+		return nil, errors.New("jwt secret is empty")
+	}
+
+	parser := jwt.NewParser(jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+	parsed, err := parser.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
 		return m.secret, nil
 	})
 	if err != nil {
-		return nil, err
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, ErrTokenExpired
+		}
+		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
-
 	if !parsed.Valid {
-		return nil, errors.New("invalid token")
+		return nil, ErrInvalidToken
 	}
 
 	claims, ok := parsed.Claims.(jwt.MapClaims)
 	if !ok {
-		return nil, errors.New("invalid claims")
+		return nil, ErrInvalidToken
 	}
-
 	if claims["type"] != "access" {
-		return nil, errors.New("not access token")
+		return nil, ErrInvalidTokenType
+	}
+	if err := m.validateRegisteredClaims(claims); err != nil {
+		return nil, err
 	}
 
 	userID, err := claimInt64(claims, "user_id")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
-
 	iat, err := claimInt64(claims, "iat")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
-
 	exp, err := claimInt64(claims, "exp")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
 
 	extras := make(map[string]interface{})
 	for k, v := range claims {
-		if k == "user_id" || k == "type" || k == "exp" || k == "iat" || k == "jti" {
+		if isReservedClaim(k) {
 			continue
 		}
 		extras[k] = normalizeValue(v)
@@ -156,70 +156,12 @@ func (m *Manager) ValidateAccessTokenDetailed(tokenStr string) (*AccessTokenClai
 
 	return &AccessTokenClaims{
 		UserID:    userID,
+		SessionID: stringClaim(claims, "sid"),
 		IssuedAt:  iat,
 		ExpiresAt: exp,
+		Issuer:    stringClaim(claims, "iss"),
+		Audience:  audienceClaim(claims),
 		Extra:     extras,
-	}, nil
-}
-
-func (m *Manager) ValidateRefreshToken(tokenStr string) (userID int64, jti string, exp int64, err error) {
-	claims, err := m.ValidateRefreshTokenDetailed(tokenStr)
-	if err != nil {
-		return 0, "", 0, err
-	}
-
-	return claims.UserID, claims.JTI, claims.ExpiresAt, nil
-}
-
-func (m *Manager) ValidateRefreshTokenDetailed(tokenStr string) (*RefreshTokenClaims, error) {
-	parsed, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
-		if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
-		return m.secret, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	if !parsed.Valid {
-		return nil, errors.New("invalid refresh token")
-	}
-
-	claims, ok := parsed.Claims.(jwt.MapClaims)
-	if !ok {
-		return nil, errors.New("invalid claims")
-	}
-
-	if claims["type"] != "refresh" {
-		return nil, errors.New("not refresh token")
-	}
-
-	userID, err := claimInt64(claims, "user_id")
-	if err != nil {
-		return nil, err
-	}
-
-	jti, ok := claims["jti"].(string)
-	if !ok || jti == "" {
-		return nil, errors.New("jti not found")
-	}
-
-	iat, err := claimInt64(claims, "iat")
-	if err != nil {
-		return nil, err
-	}
-
-	exp, err := claimInt64(claims, "exp")
-	if err != nil {
-		return nil, err
-	}
-
-	return &RefreshTokenClaims{
-		UserID:    userID,
-		JTI:       jti,
-		IssuedAt:  iat,
-		ExpiresAt: exp,
 	}, nil
 }
 
@@ -234,7 +176,10 @@ func GetExp(tokenStr string) (int64, error) {
 		return 0, err
 	}
 
-	claims := tok.Claims.(jwt.MapClaims)
+	claims, ok := tok.Claims.(jwt.MapClaims)
+	if !ok {
+		return 0, ErrInvalidToken
+	}
 
 	expf, ok := claims["exp"].(float64)
 	if !ok {
@@ -242,6 +187,31 @@ func GetExp(tokenStr string) (int64, error) {
 	}
 
 	return int64(expf), nil
+}
+
+func GenerateOpaqueRefreshToken() (string, error) {
+	return GenerateOpaqueToken(32)
+}
+
+func GenerateOpaqueToken(byteLen int) (string, error) {
+	if byteLen < 32 {
+		byteLen = 32
+	}
+	b := make([]byte, byteLen)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func (m *Manager) validateRegisteredClaims(claims jwt.MapClaims) error {
+	if m.issuer != "" && stringClaim(claims, "iss") != m.issuer {
+		return fmt.Errorf("%w: invalid issuer", ErrInvalidToken)
+	}
+	if len(m.audience) > 0 && !audienceMatches(audienceClaim(claims), m.audience) {
+		return fmt.Errorf("%w: invalid audience", ErrInvalidToken)
+	}
+	return nil
 }
 
 func claimInt64(claims jwt.MapClaims, name string) (int64, error) {
@@ -299,4 +269,48 @@ func normalizeValue(v interface{}) interface{} {
 	default:
 		return v
 	}
+}
+
+func isReservedClaim(name string) bool {
+	switch name {
+	case "user_id", "type", "exp", "iat", "jti", "sid", "iss", "aud", "nbf", "sub":
+		return true
+	default:
+		return false
+	}
+}
+
+func stringClaim(claims jwt.MapClaims, name string) string {
+	v, _ := claims[name].(string)
+	return v
+}
+
+func audienceClaim(claims jwt.MapClaims) []string {
+	switch v := claims["aud"].(type) {
+	case string:
+		return []string{v}
+	case []string:
+		return append([]string(nil), v...)
+	case []interface{}:
+		values := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				values = append(values, s)
+			}
+		}
+		return values
+	default:
+		return nil
+	}
+}
+
+func audienceMatches(actual, expected []string) bool {
+	for _, a := range actual {
+		for _, e := range expected {
+			if a == e {
+				return true
+			}
+		}
+	}
+	return false
 }

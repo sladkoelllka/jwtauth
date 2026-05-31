@@ -8,20 +8,26 @@ import (
 )
 
 type Blacklist struct {
-	client *redis.Client
+	client redis.UniversalClient
 	prefix string
 }
 
-func NewBlacklist(client *redis.Client) *Blacklist {
+func NewBlacklist(client redis.UniversalClient) *Blacklist {
 	return &Blacklist{
 		client: client,
 		prefix: "blacklist:",
 	}
 }
 
-func (b *Blacklist) Add(token string, exp int64) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+func (b *Blacklist) WithPrefix(prefix string) *Blacklist {
+	b.prefix = prefix
+	return b
+}
+
+func (b *Blacklist) AddContext(ctx context.Context, token string, exp int64) error {
+	if b == nil || b.client == nil {
+		return nil
+	}
 
 	ttl := time.Until(time.Unix(exp, 0))
 	if ttl <= 0 {
@@ -32,9 +38,10 @@ func (b *Blacklist) Add(token string, exp int64) error {
 	return b.client.Set(ctx, key, "1", ttl).Err()
 }
 
-func (b *Blacklist) Exists(token string) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+func (b *Blacklist) ExistsContext(ctx context.Context, token string) (bool, error) {
+	if b == nil || b.client == nil {
+		return false, nil
+	}
 
 	key := b.prefix + HashToken(token)
 	n, err := b.client.Exists(ctx, key).Result()
